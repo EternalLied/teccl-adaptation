@@ -1,0 +1,28 @@
+{
+    "TopologyParams": {
+        "name": "Torus",
+        "chassis": 1,
+        "total_data_MB": 1024,
+        "side_length": 4
+    },
+    "GurobiParams": {
+        "time_limit": 300,
+        "output_flag": 1,
+        "log_to_console": 1,
+        "log_file": "Logs/torus_alltoall.log"
+    },
+    "InstanceParams": {
+        "collective": 2,
+        "num_chunks": 1,
+        "epoch_type": 1,
+        "epoch_duration": -1,
+        "epoch_multiplier": 1,
+        "num_epochs": 50,
+        "alpha_threshold": 0.1,
+        "alpha_epoch_duration_ratio_max": 100,
+        "objective_type": 1,
+        "solution_method": 1,
+        "debug": true,
+        "debug_output_file": "Logs/torus_alltoall_debug.txt"
+    }
+}

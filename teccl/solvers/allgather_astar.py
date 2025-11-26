@@ -197,17 +197,79 @@ class AStarFormulation(AllGatherFormulation):
             Traces the path of the chunk from the destination to the source accumulating the flows required to satisfy the demand.
             All the flows that are not required are removed.
         """
+        from collections import defaultdict
         flows, demand_met_epoch, buffers, _ = self.get_flows_buffer_demand()
 
         # In an A* round, we can't say whether a flow is required or not until the end of all the rounds as
         #  the node receiving the chunk may be an intermediate node in the path to the destination in the later rounds.
         flows.sort(key=lambda x: x[4])
         flows_str_info = {}
+        total_nodes = self.topology.node_per_chassis * self.topology.chassis
+        flows_str_info["0-Total_Data_GB"] = total_nodes * self.topology.chunk_size * self.num_chunks
         flows_str_info["1-Epoch_Duration"] = self.epoch_duration
         flows_str_info["2-Expected_Epoch_Duration"] = self.expected_epoch_duration
         flows_str_info["3-Epochs_Required"] = self.total_epochs
         flows_str_info["4-Collective_Finish_Time"] = flows_str_info["1-Epoch_Duration"] * flows_str_info["3-Epochs_Required"]
-        flows_str_info["5-Algo_Bandwidth"] = self.topology.node_per_chassis * self.topology.chunk_size * self.topology.chassis / flows_str_info["4-Collective_Finish_Time"]
+        flows_str_info["5-Algo_Bandwidth"] = self.topology.node_per_chassis * self.topology.chunk_size * self.topology.chassis * self.num_chunks / flows_str_info["4-Collective_Finish_Time"]
+        # Alpha post-processing compensation (ignored small alphas)
+        alpha_threshold = self.user_input.instance.alpha_threshold
+        # Static all-links scan (legacy):
+        ignored_alphas_static = []
+        for i in range(len(self.topology.alpha)):
+            for j in range(len(self.topology.alpha[i])):
+                link_alpha = self.topology.alpha[i][j]
+                if link_alpha > 0 and (link_alpha / self.epoch_duration) <= alpha_threshold:
+                    ignored_alphas_static.append(link_alpha)
+        total_ignored_alpha_static = sum(ignored_alphas_static)
+        max_ignored_alpha_static = max(ignored_alphas_static) if ignored_alphas_static else 0
+        
+        # Path-level per-epoch max schedule-based compensation (path_epoch_max):
+        #  A* 模式下尚未构造精确的 (s,d,c) 完整路径，这里用近似：将最终到达 GPU (非 switch) 的最后一跳视作目的 d，
+        #  并聚合该源 s 与 chunk c 在到达 d 之前所有相关 hop 被忽略 alpha。
+        #  然后对每个 epoch 取所有路径的最大值，避免不同目的合并导致的高估。此近似可后续替换为完整路径回溯。
+        path_epoch_alpha = defaultdict(lambda: defaultdict(float))  # (s,d,c) -> epoch -> ignored_alpha_sum
+        # 标记最终目的节点: 最后一跳的接收节点且不是交换机
+        final_hops = [(s,i,j,c,k) for s,i,j,c,k in flows if j not in self.topology.switch_indices]
+        for s,i,j,c,k in flows:
+            if self.topology.capacity[i][j] <= 0:
+                continue
+            link_alpha = self.topology.alpha[i][j]
+            if link_alpha <= 0 or (link_alpha / self.epoch_duration) > alpha_threshold:
+                continue
+            # 找到与该 (s,c) 相关的最终目的集合
+            destinations = [jh for ss,ii,jh,cc,kk in final_hops if ss==s and cc==c and kk>=k]
+            if not destinations:
+                continue
+            # 将该 hop 贡献给所有尚未完成的目的的路径（保守，不会低估单条路径 alpha）
+            for d in destinations:
+                path_epoch_alpha[(s,d,c)][k] += link_alpha
+        per_epoch_path_alpha = defaultdict(dict)
+        for path_key, epoch_map in path_epoch_alpha.items():
+            for ek, val in epoch_map.items():
+                per_epoch_path_alpha[ek][path_key] = val
+        epoch_max_compensations = [max(path_map.values()) for k, path_map in sorted(per_epoch_path_alpha.items(), key=lambda x: x[0])] if per_epoch_path_alpha else []
+        total_schedule_based_compensation = sum(epoch_max_compensations) if epoch_max_compensations else 0
+        
+        used_ignored_links = set()
+        for s, i, j, c, k in flows:
+            link_alpha = self.topology.alpha[i][j]
+            if link_alpha > 0 and (link_alpha / self.epoch_duration) <= alpha_threshold:
+                used_ignored_links.add((i, j))
+        
+        flows_str_info["Alpha_Threshold"] = alpha_threshold
+        flows_str_info["Static_Ignored_Alpha_Links_Count"] = len(ignored_alphas_static)
+        flows_str_info["Used_Ignored_Alpha_Links_Count"] = len(used_ignored_links)
+        flows_str_info["Compensation_Strategy"] = "path_epoch_max"
+        flows_str_info["Path_Count"] = len(path_epoch_alpha)
+        flows_str_info["Epoch_Compensation_us"] = [v * 1e6 for v in epoch_max_compensations]
+        flows_str_info["Schedule_Based_Compensation_us"] = total_schedule_based_compensation * 1e6  # Convert to microseconds
+        
+        # Chunk-epoch grouped compensation (Option C):
+        flows_str_info["4b-Collective_Finish_Time_ScheduleBased"] = flows_str_info["4-Collective_Finish_Time"] + total_schedule_based_compensation
+        if flows_str_info["4b-Collective_Finish_Time_ScheduleBased"] > 0:
+            flows_str_info["5b-Algo_Bandwidth_ScheduleBased"] = self.topology.node_per_chassis * self.topology.chunk_size * self.topology.chassis * self.num_chunks / flows_str_info["4b-Collective_Finish_Time_ScheduleBased"]
+        else:
+            flows_str_info["5b-Algo_Bandwidth_ScheduleBased"] = flows_str_info["5-Algo_Bandwidth"]
         flows_str_info['7-Flows'] = [
             f"Chunk {c} from {s} traveled over {i}->{j} in epoch {k}" for s, i, j, c, k in flows]
         return flows, flows_str_info

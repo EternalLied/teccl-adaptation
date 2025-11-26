@@ -6,13 +6,14 @@ from enum import Enum
 class TopologyParams:
     name: str = "DGX1"
     chassis: int = 1
-    chunk_size: float = 1 # in GB
+    total_data_MB: float = 1024 # Total data in MB (will be converted to chunk_size internally)
+    chunk_size: float = 0.0 # in GB, auto-calculated from total_data_MB
     alpha: tuple = (0 ,0) # (link alpha, switch alpha)
     side_length: int = 4 # Only for Mesh and Torus topology
 
 @dataclass
 class GurobiParams:
-    time_limit: float = 2           # in hrs https://www.gurobi.com/documentation/10.0/refman/timelimit.html 
+    time_limit: float = 0.5         # in hrs (30 minutes) https://www.gurobi.com/documentation/10.0/refman/timelimit.html 
     feasibility_tol: float = 1e-4   # https://www.gurobi.com/documentation/10.0/refman/feasibilitytol.html
     intfeas_tol: float = 1e-4       # https://www.gurobi.com/documentation/10.0/refman/intfeastol.html
     optimality_tol: float = 1e-4    # https://www.gurobi.com/documentation/10.0/refman/optimalitytol.html
@@ -80,7 +81,7 @@ class InstanceParams:
     debug_output_file: str = "" # If debug is True, prints debug information to this file
     objective_type: ObjectiveType = ObjectiveType.PAPER # The objective function to be used (3 - The objective function used in the paper)
     solution_method: SolutionMethod = SolutionMethod.ONE_SHOT
-    schedule_output_file: str = "" # If not empty, the schedule is written to this file. Default is "Topology-Chunks-chunksize-timestamp.json"
+    schedule_output_folder: str = "teccl/examples/schedules" # Default output folder for schedule files. Filename is auto-generated.
     lower: bool = False # If true will use the lowering code from Meghan to lower the input.
     lower_xml: str = "" # If not empty, the XML is written to this file. Default is "Topology-Chunks-chunksize-timestamp.xml"
     warmstart: str = "" # If not empty, the warmstart file is used to warmstart the optimization.

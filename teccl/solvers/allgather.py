@@ -568,6 +568,7 @@ class AllGatherFormulation(BaseFormulation):
             Traces the path of the chunk from the destination to the source accumulating the flows required to satisfy the demand.
             All the flows that are not required are removed.
         """
+        from collections import defaultdict
         flows, demand_met_epoch, buffers, _ = self.get_flows_buffer_demand()
         logging.debug(f'Number of flows before pruning: {len(flows)}')
         if astar:
@@ -575,11 +576,57 @@ class AllGatherFormulation(BaseFormulation):
             #  the node receiving the chunk may be an intermediate node in the path to the destination in the later rounds.
             flows.sort(key=lambda x: x[4])
             flows_str_info = {}
+            # Total application data volume (GB) = total nodes * chunk_size * num_chunks contribution per node (AllGather each node contributes one chunk)
+            total_nodes = self.topology.node_per_chassis * self.topology.chassis
+            flows_str_info["0-Total_Data_GB"] = total_nodes * self.topology.chunk_size * self.num_chunks
             flows_str_info["1-Epoch_Duration"] = self.epoch_duration
             flows_str_info["2-Expected_Epoch_Duration"] = self.expected_epoch_duration
             flows_str_info["3-Epochs_Required"] = self.find_demand_satisfied_k() + 1
             flows_str_info["4-Collective_Finish_Time"] = flows_str_info["1-Epoch_Duration"] * flows_str_info["3-Epochs_Required"]
-            flows_str_info["5-Algo_Bandwidth"] = self.topology.node_per_chassis * self.topology.chunk_size * self.topology.chassis / flows_str_info["4-Collective_Finish_Time"]
+            flows_str_info["5-Algo_Bandwidth"] = self.topology.node_per_chassis * self.topology.chunk_size * self.topology.chassis * self.num_chunks / flows_str_info["4-Collective_Finish_Time"]
+            # Alpha post-processing compensation (ignored small alphas)
+            alpha_threshold = self.user_input.instance.alpha_threshold
+            # Static all-links scan (legacy):
+            ignored_alphas_static = []
+            for i in range(len(self.topology.alpha)):
+                for j in range(len(self.topology.alpha[i])):
+                    link_alpha = self.topology.alpha[i][j]
+                    if link_alpha > 0 and (link_alpha / self.epoch_duration) <= alpha_threshold:
+                        ignored_alphas_static.append(link_alpha)
+            total_ignored_alpha_static = sum(ignored_alphas_static)
+            max_ignored_alpha_static = max(ignored_alphas_static) if ignored_alphas_static else 0
+            
+            # Per-epoch chunk-max schedule-based compensation:
+            #  对每个 (epoch, chunk) 累积该 chunk 在该 epoch 内所有串行 hop 的被忽略 alpha；
+            #  该 epoch 中所有 chunk 是并行的，取该 epoch 的最大 chunk 累积；各 epoch 串行求和得到最终补偿。
+            per_epoch_chunk_alpha = defaultdict(lambda: defaultdict(float))
+            for s, i, j, c, k in flows:
+                if self.topology.capacity[i][j] > 0:
+                    link_alpha = self.topology.alpha[i][j]
+                    if link_alpha > 0 and (link_alpha / self.epoch_duration) <= alpha_threshold:
+                        per_epoch_chunk_alpha[k][(s, c)] += link_alpha
+            epoch_max_compensations = [max(chunk_map.values()) for k, chunk_map in sorted(per_epoch_chunk_alpha.items(), key=lambda x: x[0])] if per_epoch_chunk_alpha else []
+            total_schedule_based_compensation = sum(epoch_max_compensations) if epoch_max_compensations else 0
+            
+            used_ignored_links = set()
+            for s, i, j, c, k in flows:
+                link_alpha = self.topology.alpha[i][j]
+                if link_alpha > 0 and (link_alpha / self.epoch_duration) <= alpha_threshold:
+                    used_ignored_links.add((i, j))
+            
+            flows_str_info["Alpha_Threshold"] = alpha_threshold
+            flows_str_info["Static_Ignored_Alpha_Links_Count"] = len(ignored_alphas_static)
+            flows_str_info["Used_Ignored_Alpha_Links_Count"] = len(used_ignored_links)
+            flows_str_info["Epoch_Compensation_us"] = [v * 1e6 for v in epoch_max_compensations]
+            flows_str_info["Schedule_Based_Compensation_us"] = total_schedule_based_compensation * 1e6  # Convert to microseconds
+            
+            # Chunk-epoch grouped compensation (Option C):
+            flows_str_info["4b-Collective_Finish_Time_ScheduleBased"] = flows_str_info["4-Collective_Finish_Time"] + total_schedule_based_compensation
+            if flows_str_info["4b-Collective_Finish_Time_ScheduleBased"] > 0:
+                flows_str_info["5b-Algo_Bandwidth_ScheduleBased"] = self.topology.node_per_chassis * self.topology.chunk_size * self.topology.chassis * self.num_chunks / flows_str_info["4b-Collective_Finish_Time_ScheduleBased"]
+            else:
+                flows_str_info["5b-Algo_Bandwidth_ScheduleBased"] = flows_str_info["5-Algo_Bandwidth"]
+            
             flows_str_info['7-Flows'] = [
                 f"Chunk {c} from {s} traveled over {i}->{j} in epoch {k}" for s, i, j, c, k in flows]
             return flows, flows_str_info
@@ -630,8 +677,12 @@ class AllGatherFormulation(BaseFormulation):
                 required_flows.add(closest_flow)
                 my_path.append(closest_flow)
             chunk_str_path = self.chunk_flow_path_to_string(my_path)
-            chunk_paths[f"Demand at {d} for chunk {c} from {s} met by epoch {demand_met_k}"] = [
-                x[1] for x in chunk_str_path]
+            # 保存字符串路径用于输出（保持原格式）
+            chunk_paths[f"Demand at {d} for chunk {c} from {s} met by epoch {demand_met_k}"] = [x[1] for x in chunk_str_path]
+            # 额外保存原始流元组列表，供路径级补偿计算
+            if 'chunk_paths_flows' not in locals():
+                chunk_paths_flows = {}
+            chunk_paths_flows[(s, d, c)] = list(my_path)
             for epoch, cpath in chunk_str_path:
                 required_flows_str.add(
                     (epoch, f"Chunk {c} from {s} traveled over {cpath}"))
@@ -642,11 +693,70 @@ class AllGatherFormulation(BaseFormulation):
         required_flows_str = list(required_flows_str)
         required_flows_str.sort(key=lambda x: x[0])
         flows_str_info = {}
+        total_nodes = self.topology.node_per_chassis * self.topology.chassis
+        flows_str_info["0-Total_Data_GB"] = total_nodes * self.topology.chunk_size * self.num_chunks
         flows_str_info["1-Epoch_Duration"] = self.epoch_duration
         flows_str_info["2-Expected_Epoch_Duration"] = self.expected_epoch_duration
         flows_str_info["3-Epochs_Required"] = self.find_demand_satisfied_k() + 1
         flows_str_info["4-Collective_Finish_Time"] = flows_str_info["1-Epoch_Duration"] * flows_str_info["3-Epochs_Required"]
-        flows_str_info["5-Algo_Bandwidth"] = self.topology.node_per_chassis * self.topology.chunk_size * self.topology.chassis / flows_str_info["4-Collective_Finish_Time"]
+        flows_str_info["5-Algo_Bandwidth"] = self.topology.node_per_chassis * self.topology.chunk_size * self.topology.chassis * self.num_chunks / flows_str_info["4-Collective_Finish_Time"]
+        # Alpha post-processing compensation (ignored small alphas)
+        alpha_threshold = self.user_input.instance.alpha_threshold
+        # Static all-links scan (legacy):
+        ignored_alphas_static = []
+        for i in range(len(self.topology.alpha)):
+            for j in range(len(self.topology.alpha[i])):
+                link_alpha = self.topology.alpha[i][j]
+                if link_alpha > 0 and (link_alpha / self.epoch_duration) <= alpha_threshold:
+                    ignored_alphas_static.append(link_alpha)
+        total_ignored_alpha_static = sum(ignored_alphas_static)
+        max_ignored_alpha_static = max(ignored_alphas_static) if ignored_alphas_static else 0
+        
+        # Path-level per-epoch max schedule-based compensation (path_epoch_max):
+        #  对每条需求路径 (s,d,c) : 统计该路径上属于某个 epoch 的所有串行 hop 被忽略的 alpha 之和。
+        #  同一 epoch 内多条路径并行执行，取该 epoch 所有路径补偿值的最大值；各 epoch 串行求和得到最终补偿。
+        #  这样避免原先按 (s,c) 聚合造成的不同目的节点路径合并而高估。
+        path_epoch_alpha = defaultdict(lambda: defaultdict(float))  # (s,d,c) -> epoch -> ignored_alpha_sum
+        # 使用在遍历时缓存的 chunk_paths_flows，更可靠地按路径累积忽略 alpha
+        if 'chunk_paths_flows' in locals():
+            for (s, d, c), flow_list in chunk_paths_flows.items():
+                for s2, i, j, c2, k in flow_list:
+                    if self.topology.capacity[i][j] <= 0:
+                        continue
+                    link_alpha = self.topology.alpha[i][j]
+                    if link_alpha > 0 and (link_alpha / self.epoch_duration) <= alpha_threshold:
+                        path_epoch_alpha[(s, d, c)][k] += link_alpha
+        else:
+            logging.warning("chunk_paths_flows 缺失，路径级补偿退化为 0")
+        # 汇总为按 epoch 的各路径补偿，再取最大
+        per_epoch_path_alpha = defaultdict(dict)  # epoch -> (s,d,c) -> alpha_sum
+        for path_key, epoch_map in path_epoch_alpha.items():
+            for k, val in epoch_map.items():
+                per_epoch_path_alpha[k][path_key] = val
+        epoch_max_compensations = [max(path_map.values()) for k, path_map in sorted(per_epoch_path_alpha.items(), key=lambda x: x[0])] if per_epoch_path_alpha else []
+        total_schedule_based_compensation = sum(epoch_max_compensations) if epoch_max_compensations else 0
+        
+        used_ignored_links = set()
+        for s, i, j, c, k in required_flows:
+            link_alpha = self.topology.alpha[i][j]
+            if link_alpha > 0 and (link_alpha / self.epoch_duration) <= alpha_threshold:
+                used_ignored_links.add((i, j))
+        
+        flows_str_info["Alpha_Threshold"] = alpha_threshold
+        flows_str_info["Static_Ignored_Alpha_Links_Count"] = len(ignored_alphas_static)
+        flows_str_info["Used_Ignored_Alpha_Links_Count"] = len(used_ignored_links)
+        flows_str_info["Compensation_Strategy"] = "path_epoch_max"
+        flows_str_info["Path_Count"] = len(path_epoch_alpha)
+        flows_str_info["Epoch_Compensation_us"] = [v * 1e6 for v in epoch_max_compensations]
+        flows_str_info["Schedule_Based_Compensation_us"] = total_schedule_based_compensation * 1e6  # Convert to microseconds
+        
+        # Chunk-epoch grouped compensation (Option C):
+        flows_str_info["4b-Collective_Finish_Time_ScheduleBased"] = flows_str_info["4-Collective_Finish_Time"] + total_schedule_based_compensation
+        if flows_str_info["4b-Collective_Finish_Time_ScheduleBased"] > 0:
+            flows_str_info["5b-Algo_Bandwidth_ScheduleBased"] = self.topology.node_per_chassis * self.topology.chunk_size * self.topology.chassis * self.num_chunks / flows_str_info["4b-Collective_Finish_Time_ScheduleBased"]
+        else:
+            flows_str_info["5b-Algo_Bandwidth_ScheduleBased"] = flows_str_info["5-Algo_Bandwidth"]
+        
         flows_str_info["6-Demand_Met"] = demand_met_str
         flows_str_info['7-Flows'] = [x[1] for x in required_flows_str]
         flows_str_info['8-Chunk paths'] = chunk_paths
