@@ -2,7 +2,7 @@
     "TopologyParams": {
         "name": "Torus",
         "chassis": 1,
-        "total_data_MB": 1024,
+        "total_data": "1GB",
         "side_length": 4
     },
     "GurobiParams": {
@@ -23,6 +23,7 @@
         "objective_type": 1,
         "solution_method": 1,
         "debug": true,
-        "debug_output_file": "Logs/torus_allgather_debug.txt"
+        "debug_output_file": "Logs/torus_allgather_debug.txt",
+        "allow_flow_splitting": false
     }
 }

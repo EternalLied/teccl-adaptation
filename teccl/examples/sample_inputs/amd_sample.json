@@ -2,14 +2,14 @@
     "TopologyParams": {
         "name": "AMD",
         "chassis": 1,
-        "total_data_MB": 256
+        "total_data": "256MB"
     },
     "GurobiParams": {
-        "time_limit": 0.2,
+        "time_limit": 0.5,
         "output_flag": 1,
         "log_file": "",
         "log_to_console": 0,
-           "mip_gap": 0.01,
+        "mip_gap": 0.05,
         "mip_focus": 1,
         "crossover": -1,
         "method": -1,
@@ -22,13 +22,14 @@
         "epoch_duration": -1,
         "epoch_multiplier": 1,
         "num_epochs": 40,
-        "alpha_threshold": 0.1,
+        "alpha_threshold": 100,
         "switch_copy": false,
         "debug": true,
         "debug_output_file": "",
         "objective_type": 3,
         "solution_method": 1,
-        "schedule_output_folder": "",
-        "lower": true
+        "schedule_output_folder": "teccl/examples/schedules",
+        "lower": true,
+        "allow_flow_splitting": false
     }
 }

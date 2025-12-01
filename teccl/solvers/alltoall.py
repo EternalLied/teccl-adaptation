@@ -16,7 +16,8 @@ from teccl.topologies.topology import Topology
 class AlltoAllFormulation(BaseFormulation):
     def __init__(self, user_input: UserInputParams, topology: Topology) -> None:
         super().__init__(user_input, topology)
-        self.solver_name = "AllToAll_MILP"
+        # Set solver name based on whether flow splitting is allowed
+        self.solver_name = "AllToAll_LP" if user_input.instance.allow_flow_splitting else "AllToAll_MILP"
 
     def initialize_variables(self) -> None:
         """
@@ -39,14 +40,18 @@ class AlltoAllFormulation(BaseFormulation):
         self.flow = np.zeros(
             (self.num_nodes, self.num_nodes, self.num_nodes, self.num_epochs)).tolist()
 
+        # Determine variable type based on allow_flow_splitting parameter
+        flow_vtype = GRB.CONTINUOUS if self.user_input.instance.allow_flow_splitting else GRB.INTEGER
+        
         for i, j in product(self.nodes, self.nodes):
-            if self.topology.capacity[i][j] < 0:
+            # Skip self-loops and links with no capacity
+            if i == j or self.topology.capacity[i][j] <= 0:
                 continue
             for s in self.nodes:
                 for k in self.epochs:
-                    # Use INTEGER to prevent flow splitting (no fractional chunks)
+                    # Use CONTINUOUS (LP) or INTEGER (MILP) based on allow_flow_splitting parameter
                     self.flow[s][i][j][k] = self.model.addVar(
-                        0, self.all_demand, vtype=GRB.INTEGER, name='f_%d_%d_%d_%d' % (s, i, j, k))
+                        0, self.all_demand, vtype=flow_vtype, name='f_%d_%d_%d_%d' % (s, i, j, k))
         logging.debug(
             f"Time for F (flows) initialization: {time.time() - start_time}")
 
@@ -77,13 +82,13 @@ class AlltoAllFormulation(BaseFormulation):
         # initialize remaining variables
         start_time = time.time()
         for s, i, k in product(self.nodes, self.nodes, self.epochs):
-            # Use INTEGER to prevent flow splitting (consistent with flow variables)
+            # Use CONTINUOUS (LP) or INTEGER (MILP) based on allow_flow_splitting parameter
             self.buffer[s][i][k] = self.model.addVar(
-                0, self.total_demand_at_s[s], vtype=GRB.INTEGER, name='B_%d_%d_%d' % (s, i, k))
+                0, self.total_demand_at_s[s], vtype=flow_vtype, name='B_%d_%d_%d' % (s, i, k))
             self.consumed_at_k[s][i][k] = self.model.addVar(
-                0, self.demand_at_i[(s, i)], vtype=GRB.INTEGER, name='T_%d_%d_%d' % (s, i, k))
+                0, self.demand_at_i[(s, i)], vtype=flow_vtype, name='T_%d_%d_%d' % (s, i, k))
             self.total_demand_sat[s][i][k] = self.model.addVar(
-                0, self.demand_at_i[(s, i)], vtype=GRB.INTEGER, name='t_%d_%d_%d' % (s, i, k))
+                0, self.demand_at_i[(s, i)], vtype=flow_vtype, name='t_%d_%d_%d' % (s, i, k))
 
     def destination_constraints(self) -> None:
         """
@@ -235,7 +240,8 @@ class AlltoAllFormulation(BaseFormulation):
         #                 buffer_constr <= self.buffer_limit_, name=f"buffer_limit_constr_{i}_{k}")
 
         for i, j, k in product(self.nodes, self.nodes, self.epochs):
-            if self.topology.capacity[i][j] <= 0:
+            # Skip self-loops and links with no capacity
+            if i == j or self.topology.capacity[i][j] <= 0:
                 continue
             cap_constr = gp.LinExpr(0.0)
             for s in self.nodes:
@@ -407,10 +413,14 @@ class AlltoAllFormulation(BaseFormulation):
             paths[c] += [path[c]]
         consume = round(consume, 5)
         if consume != 0:
-            print(f"source ={source}, destination={destination}, consume={consume}")
-        if consume <= 1e-6:
+            # Check if this is a significant unconsumed amount
+            if abs(consume) > 1e-6:
+                raise AssertionError(f"Unconsumed flow: consume={consume} is larger than tolerance (1e-6). "
+                                   f"Source={source}, destination={destination}. "
+                                   f"This indicates a flow accounting error.")
+        if abs(consume) <= 1e-6:
             consume = 0
-        assert consume == 0
+        assert consume == 0, f"consume={consume} after tolerance check"
         return paths
 
     def check_if_viable(self, hop: int, dest: int, step : int, instance: Tuple[int, int, int, int, float, int]) -> bool:
@@ -605,13 +615,20 @@ class AlltoAllFormulation(BaseFormulation):
 
         required_flows = []
         Kmax = self.find_demand_satisfied_k()
-        for k in range(Kmax):
+        for k in range(Kmax + 1):  # Include Kmax to capture the last epoch
             if k in per_chunk_flows.keys():
                 required_flows += per_chunk_flows[k]
         flow_str_info = {}
         total_nodes = self.topology.node_per_chassis * self.topology.chassis
         # For AlltoAll, total_data represents the receive buffer size per node, which equals user input
         flow_str_info["0-Total_Data_GB"] = self.user_input.topology.total_data_MB / 1024.0
+        flow_str_info["Collective_Type"] = self.user_input.instance.collective.name  # "ALLTOALL"
+        # For AllToAll, self.num_chunks has been multiplied by number of GPUs in scheduler.get_solver()
+        # Store the actual solver num_chunks for internal reference, but also compute original for display
+        gpus = len(self.topology.capacity) - len(self.topology.switch_indices)
+        original_num_chunks = self.num_chunks // gpus if gpus > 0 else self.num_chunks
+        flow_str_info["Num_Chunks"] = original_num_chunks  # Display original user input value
+        flow_str_info["Num_Chunks_Total"] = self.num_chunks  # Actual solver value (original * GPUs)
         flow_str_info["1-Epoch_Duration"] = self.epoch_duration
         flow_str_info["2-Expected_Epoch_Duration"] = self.expected_epoch_duration
         flow_str_info["3-Epochs_Required"] = self.find_demand_satisfied_k() + 1
@@ -637,7 +654,8 @@ class AlltoAllFormulation(BaseFormulation):
         final_receivers = {t[2] for t in required_flows if t[2] not in self.topology.switch_indices}
         for flow in required_flows:
             s, i, j, c, volume, k = flow
-            if self.topology.capacity[i][j] <= 0:
+            # Skip self-loops and links with no capacity
+            if i == j or self.topology.capacity[i][j] <= 0:
                 continue
             link_alpha = self.topology.alpha[i][j]
             if link_alpha <= 0 or (link_alpha / self.epoch_duration) > alpha_threshold:
@@ -650,8 +668,16 @@ class AlltoAllFormulation(BaseFormulation):
         for path_key, epoch_map in path_epoch_alpha.items():
             for k, val in epoch_map.items():
                 per_epoch_path_alpha[k][path_key] = val
-        epoch_max_compensations = [max(path_map.values()) for k, path_map in sorted(per_epoch_path_alpha.items(), key=lambda x: x[0])] if per_epoch_path_alpha else []
-        total_schedule_based_compensation = sum(epoch_max_compensations) if epoch_max_compensations else 0
+        # Ensure we report a compensation value for every epoch up to the number of epochs required.
+        # If an epoch has no ignored-alpha contributions, report 0.0 for that epoch.
+        epochs_required = self.find_demand_satisfied_k() + 1
+        epoch_max_compensations = []
+        for k in range(epochs_required):
+            if k in per_epoch_path_alpha and per_epoch_path_alpha[k]:
+                epoch_max_compensations.append(max(per_epoch_path_alpha[k].values()))
+            else:
+                epoch_max_compensations.append(0.0)
+        total_schedule_based_compensation = sum(epoch_max_compensations)
         
         used_ignored_links = set()
         # required_flows 元素包含 6 项 (s,i,j,c,volume,k)，这里保持显式解包

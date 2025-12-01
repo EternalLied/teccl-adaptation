@@ -579,6 +579,8 @@ class AllGatherFormulation(BaseFormulation):
             # Total application data volume (GB) = total nodes * chunk_size * num_chunks contribution per node (AllGather each node contributes one chunk)
             total_nodes = self.topology.node_per_chassis * self.topology.chassis
             flows_str_info["0-Total_Data_GB"] = total_nodes * self.topology.chunk_size * self.num_chunks
+            flows_str_info["Collective_Type"] = self.user_input.instance.collective.name  # "ALLGATHER"
+            flows_str_info["Num_Chunks"] = self.num_chunks
             flows_str_info["1-Epoch_Duration"] = self.epoch_duration
             flows_str_info["2-Expected_Epoch_Duration"] = self.expected_epoch_duration
             flows_str_info["3-Epochs_Required"] = self.find_demand_satisfied_k() + 1
@@ -605,8 +607,15 @@ class AllGatherFormulation(BaseFormulation):
                     link_alpha = self.topology.alpha[i][j]
                     if link_alpha > 0 and (link_alpha / self.epoch_duration) <= alpha_threshold:
                         per_epoch_chunk_alpha[k][(s, c)] += link_alpha
-            epoch_max_compensations = [max(chunk_map.values()) for k, chunk_map in sorted(per_epoch_chunk_alpha.items(), key=lambda x: x[0])] if per_epoch_chunk_alpha else []
-            total_schedule_based_compensation = sum(epoch_max_compensations) if epoch_max_compensations else 0
+            # Ensure we report a compensation value for every epoch up to the number of epochs required.
+            epochs_required = self.find_demand_satisfied_k() + 1 if hasattr(self, 'find_demand_satisfied_k') else (max(per_epoch_chunk_alpha.keys()) + 1 if per_epoch_chunk_alpha else 0)
+            epoch_max_compensations = []
+            for k in range(epochs_required):
+                if k in per_epoch_chunk_alpha and per_epoch_chunk_alpha[k]:
+                    epoch_max_compensations.append(max(per_epoch_chunk_alpha[k].values()))
+                else:
+                    epoch_max_compensations.append(0.0)
+            total_schedule_based_compensation = sum(epoch_max_compensations)
             
             used_ignored_links = set()
             for s, i, j, c, k in flows:
@@ -695,6 +704,8 @@ class AllGatherFormulation(BaseFormulation):
         flows_str_info = {}
         total_nodes = self.topology.node_per_chassis * self.topology.chassis
         flows_str_info["0-Total_Data_GB"] = total_nodes * self.topology.chunk_size * self.num_chunks
+        flows_str_info["Collective_Type"] = self.user_input.instance.collective.name  # "ALLGATHER"
+        flows_str_info["Num_Chunks"] = self.num_chunks
         flows_str_info["1-Epoch_Duration"] = self.epoch_duration
         flows_str_info["2-Expected_Epoch_Duration"] = self.expected_epoch_duration
         flows_str_info["3-Epochs_Required"] = self.find_demand_satisfied_k() + 1
@@ -764,6 +775,11 @@ class AllGatherFormulation(BaseFormulation):
 
     def find_demand_satisfied_k(self):
         satisfied_epochs = {}
+        # Check if model has a solution before accessing variable values
+        if self.model.SolCount == 0:
+            logging.warning("No solution available to extract demand satisfaction epochs")
+            return -1  # Return -1 to indicate no solution
+        
         for v in self.model.getVars():
             if 'total_demand_' in v.varName and v.x > 0.0:
                 components = v.varName.split('_')
@@ -778,6 +794,9 @@ class AllGatherFormulation(BaseFormulation):
                 if (str(s), str(i), str(c)) not in satisfied_epochs:
                     logging.warning(
                         f"Demand not satisfied for s_{s}, i_{i}, c_{c}")
+        
+        if not satisfied_epochs:
+            return -1  # No satisfied demands found
         return max(satisfied_epochs.values())
 
     def get_schedule(self) -> Tuple[List[Tuple[int, int, int, int, int]], Dict]:

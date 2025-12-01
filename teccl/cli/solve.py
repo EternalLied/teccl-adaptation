@@ -18,6 +18,12 @@ def make_handle_solve(cmd_parsers):
             user_input_args = json.load(jf)
             for k, v in user_input_args['TopologyParams'].items():
                 user_input.topology.__setattr__(k, v)
+            
+            # Parse total_data if provided (handle unit-suffixed strings like "1KB", "4GB")
+            if hasattr(user_input.topology, 'total_data') and user_input.topology.total_data is not None:
+                from teccl.input_data import parse_data_size
+                user_input.topology.total_data_MB = parse_data_size(user_input.topology.total_data)
+            
             for k, v in user_input_args['GurobiParams'].items():
                 user_input.gurobi.__setattr__(k, v)
             for k, v in user_input_args['InstanceParams'].items():

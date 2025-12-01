@@ -1,15 +1,69 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
+import re
+from typing import Union, Optional
+
+
+def parse_data_size(size_str: Union[str, float, int]) -> float:
+    """
+    Parse data size string with unit suffix and convert to MB.
+    
+    Args:
+        size_str: Can be:
+            - String with unit: "1KB", "4MB", "2GB", "1.5GB", etc.
+            - Numeric value (interpreted as MB for backward compatibility)
+    
+    Returns:
+        float: Size in MB
+    
+    Examples:
+        "1KB" -> 0.0009765625
+        "256KB" -> 0.25
+        "4MB" -> 4.0
+        "2GB" -> 2048.0
+        1024 -> 1024.0 (interpreted as MB)
+    """
+    if isinstance(size_str, (int, float)):
+        # Backward compatibility: numeric values are MB
+        return float(size_str)
+    
+    # Parse string with unit
+    size_str = str(size_str).strip().upper()
+    
+    # Match number (int or float) followed by optional unit
+    match = re.match(r'^([0-9]*\.?[0-9]+)\s*(KB|MB|GB|K|M|G|B)?$', size_str, re.IGNORECASE)
+    
+    if not match:
+        raise ValueError(f"Invalid data size format: {size_str}. Expected format: '1KB', '4MB', '2GB', or numeric value.")
+    
+    value = float(match.group(1))
+    unit = (match.group(2) or 'MB').upper()  # Default to MB if no unit
+    
+    # Normalize unit aliases
+    if unit in ['K', 'KB']:
+        return value / 1024  # KB to MB
+    elif unit in ['M', 'MB', 'B']:  # 'B' alone defaults to MB for backward compat
+        return value
+    elif unit in ['G', 'GB']:
+        return value * 1024  # GB to MB
+    else:
+        raise ValueError(f"Unsupported unit: {unit}. Use KB, MB, or GB.")
 
 
 @dataclass
 class TopologyParams:
     name: str = "DGX1"
     chassis: int = 1
-    total_data_MB: float = 1024 # Total data in MB (will be converted to chunk_size internally)
-    chunk_size: float = 0.0 # in GB, auto-calculated from total_data_MB
-    alpha: tuple = (0 ,0) # (link alpha, switch alpha)
-    side_length: int = 4 # Only for Mesh and Torus topology
+    total_data_MB: float = 1024  # Total data in MB (will be converted to chunk_size internally)
+    total_data: Optional[str] = None  # Alternative: data size with unit like "1KB", "4GB", etc.
+    chunk_size: float = 0.0  # in GB, auto-calculated from total_data_MB
+    alpha: tuple = (0, 0)  # (link alpha, switch alpha)
+    side_length: int = 4  # Only for Mesh and Torus topology
+    
+    def __post_init__(self):
+        """Parse total_data if provided and override total_data_MB"""
+        if self.total_data is not None:
+            self.total_data_MB = parse_data_size(self.total_data)
 
 @dataclass
 class GurobiParams:
@@ -82,6 +136,7 @@ class InstanceParams:
     objective_type: ObjectiveType = ObjectiveType.PAPER # The objective function to be used (3 - The objective function used in the paper)
     solution_method: SolutionMethod = SolutionMethod.ONE_SHOT
     schedule_output_folder: str = "teccl/examples/schedules" # Default output folder for schedule files. Filename is auto-generated.
+    allow_flow_splitting: bool = False # If True, AlltoAll uses LP (continuous flow variables); if False, uses MILP (integer flow variables)
     lower: bool = False # If true will use the lowering code from Meghan to lower the input.
     lower_xml: str = "" # If not empty, the XML is written to this file. Default is "Topology-Chunks-chunksize-timestamp.xml"
     warmstart: str = "" # If not empty, the warmstart file is used to warmstart the optimization.

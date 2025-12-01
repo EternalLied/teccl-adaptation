@@ -206,6 +206,8 @@ class AStarFormulation(AllGatherFormulation):
         flows_str_info = {}
         total_nodes = self.topology.node_per_chassis * self.topology.chassis
         flows_str_info["0-Total_Data_GB"] = total_nodes * self.topology.chunk_size * self.num_chunks
+        flows_str_info["Collective_Type"] = self.user_input.instance.collective.name  # "ALLGATHER"
+        flows_str_info["Num_Chunks"] = self.num_chunks
         flows_str_info["1-Epoch_Duration"] = self.epoch_duration
         flows_str_info["2-Expected_Epoch_Duration"] = self.expected_epoch_duration
         flows_str_info["3-Epochs_Required"] = self.total_epochs
@@ -247,8 +249,15 @@ class AStarFormulation(AllGatherFormulation):
         for path_key, epoch_map in path_epoch_alpha.items():
             for ek, val in epoch_map.items():
                 per_epoch_path_alpha[ek][path_key] = val
-        epoch_max_compensations = [max(path_map.values()) for k, path_map in sorted(per_epoch_path_alpha.items(), key=lambda x: x[0])] if per_epoch_path_alpha else []
-        total_schedule_based_compensation = sum(epoch_max_compensations) if epoch_max_compensations else 0
+        # Ensure we report a compensation value for every epoch up to the number of epochs required.
+        epochs_required = self.find_demand_satisfied_k() + 1
+        epoch_max_compensations = []
+        for k in range(epochs_required):
+            if k in per_epoch_path_alpha and per_epoch_path_alpha[k]:
+                epoch_max_compensations.append(max(per_epoch_path_alpha[k].values()))
+            else:
+                epoch_max_compensations.append(0.0)
+        total_schedule_based_compensation = sum(epoch_max_compensations)
         
         used_ignored_links = set()
         for s, i, j, c, k in flows:

@@ -185,6 +185,8 @@ class BaseFormulation(ABC):
                 continue
             device_chunk_map[d] = i
             i += 1
+        gpus = devices - len(self.topology.switch_indices)
+        
         for s in range(devices):
             for t in range(devices):
                 if s == t:
@@ -192,10 +194,10 @@ class BaseFormulation(ABC):
                 # the switch should not be sending/recieving chunks.
                 if s in self.topology.switch_indices or t in self.topology.switch_indices:
                     continue
-                gpus = devices - len(self.topology.switch_indices)
                 for c in range(chunks_per_gpu // gpus):
                     if s != t:
-                        self.demand[s][t][device_chunk_map[t] + c * gpus] = 1
+                        chunk_id = device_chunk_map[t] + c * gpus
+                        self.demand[s][t][chunk_id] = 1
         
     def set_gurobi_params(self) -> None:
         self.model.Params.OutputFlag = self.user_input.gurobi.output_flag

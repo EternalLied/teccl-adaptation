@@ -137,12 +137,17 @@ class TECCLSolver(object):
             
             if result != GRB.INFEASIBLE:
                 start_demand = time()
-                epochs_taken = solver_inst.find_demand_satisfied_k() + 1
+                epochs_taken_raw = solver_inst.find_demand_satisfied_k()
                 feasibility_timing["demand_check"] += time() - start_demand
                 
-                time_taken = epochs_taken * solver_inst.epoch_duration
-                upper_bound = time_taken
-                feasible_time = min(feasible_time, time_taken)
+                if epochs_taken_raw >= 0:
+                    epochs_taken = epochs_taken_raw + 1
+                    time_taken = epochs_taken * solver_inst.epoch_duration
+                    upper_bound = time_taken
+                    feasible_time = min(feasible_time, time_taken)
+                else:
+                    # No solution found, treat as lower bound constraint
+                    lower_bound = mid
             else:
                 lower_bound = mid
             attempts += 1
@@ -219,6 +224,10 @@ class TECCLSolver(object):
         # 简化：不再输出用时分解，仅保留总求解时间（如存在）
         solver_time = schedule_data.get("Solver_Time", "N/A")
         
+        # New fields: collective type and num_chunks
+        collective_type = schedule_data.get("Collective_Type", "N/A")
+        num_chunks = schedule_data.get("Num_Chunks", "N/A")
+        
         # Alpha compensation metrics
         alpha_threshold = schedule_data.get("Alpha_Threshold", "N/A")
         schedule_based_compensation = schedule_data.get("Schedule_Based_Compensation_us", "N/A")
@@ -231,10 +240,28 @@ class TECCLSolver(object):
         print("  TE-CCL 调度结果摘要")
         print("="*70)
         print("\n【主要性能指标】")
+        
+        # Adaptive data size display
         if total_data_gb != "N/A":
-            print(f"  0️⃣  总数据量: {total_data_gb:.4f} GB")
+            total_data_mb = total_data_gb * 1024  # Convert GB to MB
+            if total_data_mb >= 1024:
+                val = total_data_gb
+                unit = "GB"
+            elif total_data_mb < 1.0:
+                val = total_data_mb * 1024
+                unit = "KB"
+            else:
+                val = total_data_mb
+                unit = "MB"
+            print(f"  0️⃣  总数据量: {val:.4f} {unit}")
         else:
             print(f"  0️⃣  总数据量: {total_data_gb}")
+        
+        # Display collective type and num_chunks
+        if collective_type != "N/A":
+            print(f"  📦 算子类型: {collective_type}")
+        if num_chunks != "N/A":
+            print(f"  🧩 分块数量: {num_chunks}")
         
         if epoch_duration != "N/A":
             print(f"  1️⃣  Epoch 时长: {epoch_duration:.6f} 秒 (s)")
@@ -325,7 +352,8 @@ class TECCLSolver(object):
             solver = epoch_result_schedule_solver[best_epochs]["solver"]
             collective_name = user_input.instance.collective.name  # e.g., "ALLGATHER" or "ALLTOALL"
             total_data_MB = user_input.topology.total_data_MB
-            num_chunks = user_input.instance.num_chunks
+            # For AllToAll, use the original num_chunks from user input (before GPU multiplication)
+            num_chunks = getattr(self, '_original_num_chunks', user_input.instance.num_chunks)
             num_nodes = solver.num_nodes  # Get total number of nodes
             
             # Adaptive data size in filename: choose GB/MB/KB based on magnitude of total_data_MB
