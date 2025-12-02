@@ -3,7 +3,7 @@
         "name": "NDv2",
         "option": 1,
         "chassis": 4,
-        "total_data": "1024MB"
+        "total_data": "64MB"
     },
     "GurobiParams": {
         "time_limit": 0.2,
@@ -20,9 +20,9 @@
         "heuristics": 0.3
     },
     "InstanceParams": {
-        "collective": 1,
+        "collective": 2,
         "num_chunks": 1,
-        "epoch_type": 1,
+        "epoch_type": 2,
         "epoch_duration": -1,
         "num_epochs": -1,
         "alpha_threshold": 100,
